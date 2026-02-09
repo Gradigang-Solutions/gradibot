@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { Context, Options, SlashCommand, SlashCommandContext } from 'necord';
 import { GuildMember, GuildTextBasedChannel } from 'discord.js';
 import { PlayDto } from '../dto/play.dto';
@@ -7,6 +7,8 @@ import { QueueService } from '../services/queue.service';
 
 @Injectable()
 export class PlayCommand {
+  private readonly logger = new Logger(PlayCommand.name);
+
   constructor(
     private readonly playerService: PlayerService,
     private readonly queueService: QueueService,
@@ -20,48 +22,52 @@ export class PlayCommand {
     @Context() [interaction]: SlashCommandContext,
     @Options() { query }: PlayDto,
   ) {
-    if (!(interaction.member instanceof GuildMember)) {
-      return interaction.reply({
-        content: 'I need to be invited with the **bot** scope to work properly. Please re-invite me using an invite link that includes the `bot` permission.',
-        ephemeral: true,
-      });
-    }
+    try {
+      if (!(interaction.member instanceof GuildMember)) {
+        return await interaction.reply({
+          content: 'I need to be invited with the **bot** scope to work properly. Please re-invite me using an invite link that includes the `bot` permission.',
+          ephemeral: true,
+        });
+      }
 
-    const member = interaction.member;
+      const member = interaction.member;
 
-    if (!member.voice.channel) {
-      return interaction.reply({
-        content: 'You need to be in a voice channel to play music.',
-        ephemeral: true,
-      });
-    }
+      if (!member.voice.channel) {
+        return await interaction.reply({
+          content: 'You need to be in a voice channel to play music.',
+          ephemeral: true,
+        });
+      }
 
-    await interaction.deferReply();
+      await interaction.deferReply();
 
-    const track = await this.playerService.search(query);
-    if (!track) {
-      return interaction.editReply('No results found for that query.');
-    }
+      const track = await this.playerService.search(query);
+      if (!track) {
+        return await interaction.editReply('No results found for that query.');
+      }
 
-    track.requestedBy = member.displayName;
+      track.requestedBy = member.displayName;
 
-    const existingQueue = this.queueService.get(interaction.guildId!);
-    if (existingQueue) {
-      this.queueService.addTrack(interaction.guildId!, track);
-      return interaction.editReply(
-        `Added to queue: **${track.title}** (${track.duration})`,
+      const existingQueue = this.queueService.get(interaction.guildId!);
+      if (existingQueue) {
+        this.queueService.addTrack(interaction.guildId!, track);
+        return await interaction.editReply(
+          `Added to queue: **${track.title}** (${track.duration})`,
+        );
+      }
+
+      await this.playerService.joinAndPlay(
+        member.voice.channel,
+        interaction.channel! as GuildTextBasedChannel,
+        track,
+        interaction.guildId!,
       );
+
+      return await interaction.editReply(
+        `Started playing: **${track.title}** (${track.duration})`,
+      );
+    } catch (error) {
+      this.logger.error(`Play command error: ${error}`);
     }
-
-    await this.playerService.joinAndPlay(
-      member.voice.channel,
-      interaction.channel! as GuildTextBasedChannel,
-      track,
-      interaction.guildId!,
-    );
-
-    return interaction.editReply(
-      `Started playing: **${track.title}** (${track.duration})`,
-    );
   }
 }

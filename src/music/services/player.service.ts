@@ -91,6 +91,7 @@ export class PlayerService {
       currentTrack: track,
       textChannel,
       isPaused: false,
+      processes: [],
     });
 
     voiceConnection.subscribe(audioPlayer);
@@ -122,6 +123,8 @@ export class PlayerService {
     const queue = this.queueService.get(guildId);
     if (!queue) return;
 
+    this.killProcesses(queue.processes);
+
     try {
       const ytdlp = spawn('yt-dlp', [
         '-f', 'bestaudio',
@@ -145,7 +148,14 @@ export class PlayerService {
         'pipe:1',
       ]);
 
+      queue.processes = [ytdlp, ffmpeg];
+
       ytdlp.stdout.pipe(ffmpeg.stdin);
+
+      // Suppress pipe errors (EPIPE when processes are killed)
+      ytdlp.stdout.on('error', () => {});
+      ffmpeg.stdin.on('error', () => {});
+      ffmpeg.stdout.on('error', () => {});
 
       ytdlp.on('error', (err) =>
         this.logger.error(`yt-dlp error: ${err.message}`),
@@ -182,6 +192,7 @@ export class PlayerService {
   skip(guildId: string): boolean {
     const queue = this.queueService.get(guildId);
     if (!queue) return false;
+    this.killProcesses(queue.processes);
     queue.audioPlayer.stop();
     return true;
   }
@@ -206,8 +217,18 @@ export class PlayerService {
     const queue = this.queueService.get(guildId);
     if (!queue) return;
 
+    this.killProcesses(queue.processes);
     queue.audioPlayer.stop();
     queue.voiceConnection.destroy();
     this.queueService.delete(guildId);
+  }
+
+  private killProcesses(processes: import('child_process').ChildProcess[]): void {
+    for (const proc of processes) {
+      if (!proc.killed) {
+        proc.kill('SIGKILL');
+      }
+    }
+    processes.length = 0;
   }
 }
