@@ -18,33 +18,50 @@ import { createNowPlayingEmbed } from '../embeds/now-playing.embed';
 export class PlayerService {
   private readonly logger = new Logger(PlayerService.name);
 
-  constructor(private readonly queueService: QueueService) {}
+  constructor(private readonly queueService: QueueService) {
+    const cookieArgs = this.getCookieArgs();
+    if (cookieArgs.length) {
+      this.logger.log(`Cookie config: ${cookieArgs.join(' ')}`);
+    } else {
+      this.logger.warn('No cookie config found (YT_DLP_COOKIES_FILE / YT_DLP_COOKIES_FROM_BROWSER not set)');
+    }
+  }
 
   async search(query: string): Promise<Track | null> {
     const isUrl = query.startsWith('http://') || query.startsWith('https://');
+    const cookieArgs = this.getCookieArgs();
     const args = [
       isUrl ? query : `ytsearch1:${query}`,
       '--dump-json',
-      '--no-warnings',
       '--no-playlist',
-      ...this.getCookieArgs(),
+      ...cookieArgs,
     ];
+
+    this.logger.log(`Searching: "${query}" | args: ${JSON.stringify(args)}`);
 
     return new Promise((resolve) => {
       const proc = spawn('yt-dlp', args);
-      let data = '';
+      let stdout = '';
+      let stderr = '';
 
       proc.stdout.on('data', (chunk: Buffer) => {
-        data += chunk.toString();
+        stdout += chunk.toString();
+      });
+
+      proc.stderr.on('data', (chunk: Buffer) => {
+        stderr += chunk.toString();
       });
 
       proc.on('close', (code) => {
-        if (code !== 0 || !data) {
+        if (code !== 0 || !stdout) {
+          this.logger.error(`yt-dlp search failed (exit ${code}) for "${query}"`);
+          if (stderr) this.logger.error(`yt-dlp stderr: ${stderr}`);
           resolve(null);
           return;
         }
         try {
-          const info = JSON.parse(data);
+          const info = JSON.parse(stdout);
+          this.logger.log(`Found: "${info.title}" (${info.duration_string})`);
           resolve({
             url: info.webpage_url ?? info.url,
             title: info.title ?? 'Unknown',
@@ -52,12 +69,16 @@ export class PlayerService {
             thumbnail: info.thumbnail ?? '',
             requestedBy: '',
           });
-        } catch {
+        } catch (err) {
+          this.logger.error(`Failed to parse yt-dlp JSON: ${err}`);
           resolve(null);
         }
       });
 
-      proc.on('error', () => resolve(null));
+      proc.on('error', (err) => {
+        this.logger.error(`yt-dlp spawn error: ${err.message}`);
+        resolve(null);
+      });
     });
   }
 
@@ -124,14 +145,17 @@ export class PlayerService {
     this.killProcesses(queue.processes);
 
     try {
-      const ytdlp = spawn('yt-dlp', [
+      this.logger.log(`Streaming: "${track.title}" (${track.url})`);
+
+      const ytdlpArgs = [
         '-f', 'bestaudio',
         '-o', '-',
-        '--no-warnings',
         '--no-playlist',
         ...this.getCookieArgs(),
         track.url,
-      ]);
+      ];
+
+      const ytdlp = spawn('yt-dlp', ytdlpArgs);
 
       const ffmpeg = spawn('ffmpeg', [
         '-i', 'pipe:0',
@@ -148,13 +172,25 @@ export class PlayerService {
 
       ytdlp.stdout.pipe(ffmpeg.stdin);
 
+      let ytdlpStderr = '';
+      ytdlp.stderr.on('data', (chunk: Buffer) => {
+        ytdlpStderr += chunk.toString();
+      });
+
       // Suppress pipe errors (EPIPE when processes are killed)
       ytdlp.stdout.on('error', () => {});
       ffmpeg.stdin.on('error', () => {});
       ffmpeg.stdout.on('error', () => {});
 
+      ytdlp.on('close', (code) => {
+        if (code !== 0) {
+          this.logger.error(`yt-dlp stream exited with code ${code}`);
+          if (ytdlpStderr) this.logger.error(`yt-dlp stderr: ${ytdlpStderr}`);
+        }
+      });
+
       ytdlp.on('error', (err) =>
-        this.logger.error(`yt-dlp error: ${err.message}`),
+        this.logger.error(`yt-dlp spawn error: ${err.message}`),
       );
       ffmpeg.on('error', (err) =>
         this.logger.error(`FFmpeg error: ${err.message}`),
