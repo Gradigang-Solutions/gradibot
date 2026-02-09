@@ -27,9 +27,7 @@ export class PlayerService {
       '--dump-json',
       '--no-warnings',
       '--no-playlist',
-      ...(process.env.YT_DLP_COOKIES_FROM_BROWSER
-        ? ['--cookies-from-browser', process.env.YT_DLP_COOKIES_FROM_BROWSER]
-        : []),
+      ...this.getCookieArgs(),
     ];
 
     return new Promise((resolve) => {
@@ -131,9 +129,7 @@ export class PlayerService {
         '-o', '-',
         '--no-warnings',
         '--no-playlist',
-        ...(process.env.YT_DLP_COOKIES_FROM_BROWSER
-          ? ['--cookies-from-browser', process.env.YT_DLP_COOKIES_FROM_BROWSER]
-          : []),
+        ...this.getCookieArgs(),
         track.url,
       ]);
 
@@ -221,6 +217,16 @@ export class PlayerService {
     queue.audioPlayer.stop();
     queue.voiceConnection.destroy();
     this.queueService.delete(guildId);
+  }
+
+  private getCookieArgs(): string[] {
+    if (process.env.YT_DLP_COOKIES_FILE) {
+      return ['--cookies', process.env.YT_DLP_COOKIES_FILE];
+    }
+    if (process.env.YT_DLP_COOKIES_FROM_BROWSER) {
+      return ['--cookies-from-browser', process.env.YT_DLP_COOKIES_FROM_BROWSER];
+    }
+    return [];
   }
 
   private killProcesses(processes: import('child_process').ChildProcess[]): void {
