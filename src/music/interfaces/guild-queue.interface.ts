@@ -11,4 +11,5 @@ export interface GuildQueue {
   textChannel: GuildTextBasedChannel;
   isPaused: boolean;
   processes: ChildProcess[];
+  idleTimeout: ReturnType<typeof setTimeout> | null;
 }

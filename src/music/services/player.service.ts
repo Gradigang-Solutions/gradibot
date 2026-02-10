@@ -5,11 +5,13 @@ import {
   createAudioResource,
   entersState,
   joinVoiceChannel,
+  NoSubscriberBehavior,
   StreamType,
   VoiceConnectionStatus,
 } from '@discordjs/voice';
 import { GuildTextBasedChannel, VoiceBasedChannel } from 'discord.js';
 import { spawn } from 'child_process';
+import { PassThrough } from 'stream';
 import { QueueService } from './queue.service';
 import { Track } from '../interfaces/track.interface';
 import { createNowPlayingEmbed } from '../embeds/now-playing.embed';
@@ -91,7 +93,11 @@ export class PlayerService {
     const existingQueue = this.queueService.get(guildId);
 
     if (existingQueue) {
+      this.clearIdleTimeout(existingQueue);
       this.queueService.addTrack(guildId, track);
+      if (!existingQueue.currentTrack) {
+        await this.streamTrack(guildId, track);
+      }
       return;
     }
 
@@ -101,7 +107,11 @@ export class PlayerService {
       adapterCreator: voiceChannel.guild.voiceAdapterCreator,
     });
 
-    const audioPlayer = createAudioPlayer();
+    const audioPlayer = createAudioPlayer({
+      behaviors: {
+        noSubscriber: NoSubscriberBehavior.Play,
+      },
+    });
 
     this.queueService.set(guildId, {
       voiceConnection,
@@ -111,6 +121,7 @@ export class PlayerService {
       textChannel,
       isPaused: false,
       processes: [],
+      idleTimeout: null,
     });
 
     voiceConnection.subscribe(audioPlayer);
@@ -158,13 +169,19 @@ export class PlayerService {
       const ytdlp = spawn('yt-dlp', ytdlpArgs);
 
       const ffmpeg = spawn('ffmpeg', [
-        '-i', 'pipe:0',
         '-analyzeduration', '0',
+        '-probesize', '32768',
+        '-i', 'pipe:0',
         '-loglevel', '0',
         '-acodec', 'libopus',
         '-f', 'ogg',
         '-ar', '48000',
         '-ac', '2',
+        '-b:a', '128k',
+        '-vbr', 'on',
+        '-compression_level', '10',
+        '-application', 'audio',
+        '-frame_duration', '20',
         'pipe:1',
       ]);
 
@@ -196,8 +213,13 @@ export class PlayerService {
         this.logger.error(`FFmpeg error: ${err.message}`),
       );
 
-      const resource = createAudioResource(ffmpeg.stdout, {
+      const buffer = new PassThrough({ highWaterMark: 1024 * 1024 });
+      ffmpeg.stdout.pipe(buffer);
+      buffer.on('error', () => {});
+
+      const resource = createAudioResource(buffer, {
         inputType: StreamType.OggOpus,
+        silencePaddingFrames: 0,
       });
 
       queue.currentTrack = track;
@@ -212,12 +234,34 @@ export class PlayerService {
     }
   }
 
+  private static readonly IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+
   playNext(guildId: string): void {
     const nextTrack = this.queueService.nextTrack(guildId);
     if (nextTrack) {
       this.streamTrack(guildId, nextTrack);
     } else {
+      this.scheduleIdleDisconnect(guildId);
+    }
+  }
+
+  private scheduleIdleDisconnect(guildId: string): void {
+    const queue = this.queueService.get(guildId);
+    if (!queue) return;
+
+    this.clearIdleTimeout(queue);
+    queue.currentTrack = null;
+
+    queue.idleTimeout = setTimeout(() => {
+      this.logger.log(`Idle timeout reached for guild ${guildId}, disconnecting`);
       this.destroy(guildId);
+    }, PlayerService.IDLE_TIMEOUT_MS);
+  }
+
+  private clearIdleTimeout(queue: import('../interfaces/guild-queue.interface').GuildQueue): void {
+    if (queue.idleTimeout) {
+      clearTimeout(queue.idleTimeout);
+      queue.idleTimeout = null;
     }
   }
 
@@ -249,6 +293,7 @@ export class PlayerService {
     const queue = this.queueService.get(guildId);
     if (!queue) return;
 
+    this.clearIdleTimeout(queue);
     this.killProcesses(queue.processes);
     queue.audioPlayer.stop();
     queue.voiceConnection.destroy();
