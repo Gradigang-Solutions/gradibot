@@ -49,12 +49,7 @@ export class PlayCommand {
       track.requestedBy = member.displayName;
 
       const existingQueue = this.queueService.get(interaction.guildId!);
-      if (existingQueue) {
-        this.queueService.addTrack(interaction.guildId!, track);
-        return await interaction.editReply(
-          `Added to queue: **${track.title}** (${track.duration})`,
-        );
-      }
+      const wasPlaying = existingQueue?.currentTrack != null;
 
       await this.playerService.joinAndPlay(
         member.voice.channel,
@@ -64,7 +59,9 @@ export class PlayCommand {
       );
 
       return await interaction.editReply(
-        `Started playing: **${track.title}** (${track.duration})`,
+        wasPlaying
+          ? `Added to queue: **${track.title}** (${track.duration})`
+          : `Started playing: **${track.title}** (${track.duration})`,
       );
     } catch (error) {
       this.logger.error(`Play command error: ${error}`);

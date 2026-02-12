@@ -1,7 +1,12 @@
-import { EmbedBuilder } from 'discord.js';
+import {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  EmbedBuilder,
+} from 'discord.js';
 import { GuildQueue } from '../interfaces/guild-queue.interface';
 
-export function createQueueEmbed(queue: GuildQueue) {
+export function createQueueEmbed(queue: GuildQueue, guildId: string) {
   const embed = new EmbedBuilder()
     .setTitle('Music Queue')
     .setColor(0x5865f2);
@@ -31,5 +36,13 @@ export function createQueueEmbed(queue: GuildQueue) {
     embed.addFields({ name: 'Up Next', value: 'No tracks in queue' });
   }
 
-  return embed;
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`music/clear/${guildId}`)
+      .setLabel('Clear Queue')
+      .setStyle(ButtonStyle.Danger)
+      .setEmoji('\uD83D\uDDD1\uFE0F'),
+  );
+
+  return { embed, row };
 }

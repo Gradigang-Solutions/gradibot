@@ -14,7 +14,11 @@ import { spawn } from 'child_process';
 import { PassThrough } from 'stream';
 import { QueueService } from './queue.service';
 import { Track } from '../interfaces/track.interface';
-import { createNowPlayingEmbed } from '../embeds/now-playing.embed';
+import {
+  createNowPlayingEmbed,
+  createNowPlayingComponents,
+  createPlayedEmbed,
+} from '../embeds/now-playing.embed';
 
 @Injectable()
 export class PlayerService {
@@ -94,9 +98,10 @@ export class PlayerService {
 
     if (existingQueue) {
       this.clearIdleTimeout(existingQueue);
-      this.queueService.addTrack(guildId, track);
-      if (!existingQueue.currentTrack) {
+      if (!existingQueue.currentTrack && !existingQueue.isStreamTransitioning) {
         await this.streamTrack(guildId, track);
+      } else {
+        this.queueService.addTrack(guildId, track);
       }
       return;
     }
@@ -122,6 +127,9 @@ export class PlayerService {
       isPaused: false,
       processes: [],
       idleTimeout: null,
+      nowPlayingMessage: null,
+      recommendations: [],
+      isStreamTransitioning: false,
     });
 
     voiceConnection.subscribe(audioPlayer);
@@ -149,14 +157,30 @@ export class PlayerService {
     await this.streamTrack(guildId, track);
   }
 
-  async streamTrack(guildId: string, track: Track): Promise<void> {
+  async streamTrack(guildId: string, track: Track, previousTrack?: Track | null): Promise<void> {
     const queue = this.queueService.get(guildId);
     if (!queue) return;
 
+    queue.isStreamTransitioning = true;
+    queue.currentTrack = track;
     this.killProcesses(queue.processes);
 
     try {
       this.logger.log(`Streaming: "${track.title}" (${track.url})`);
+
+      // Edit previous Now Playing message into a "Played" embed
+      if (queue.nowPlayingMessage && previousTrack) {
+        try {
+          const { embed } = createPlayedEmbed(previousTrack);
+          await queue.nowPlayingMessage.edit({
+            embeds: [embed],
+            components: [],
+          });
+        } catch (err) {
+          this.logger.warn(`Failed to edit previous Now Playing message: ${err}`);
+        }
+        queue.nowPlayingMessage = null;
+      }
 
       const ytdlpArgs = [
         '-f', 'bestaudio',
@@ -200,7 +224,7 @@ export class PlayerService {
       ffmpeg.stdout.on('error', () => {});
 
       ytdlp.on('close', (code) => {
-        if (code !== 0) {
+        if (code !== 0 && code !== null) {
           this.logger.error(`yt-dlp stream exited with code ${code}`);
           if (ytdlpStderr) this.logger.error(`yt-dlp stderr: ${ytdlpStderr}`);
         }
@@ -222,24 +246,120 @@ export class PlayerService {
         silencePaddingFrames: 0,
       });
 
-      queue.currentTrack = track;
       queue.isPaused = false;
+      queue.recommendations = [];
       queue.audioPlayer.play(resource);
+      queue.isStreamTransitioning = false;
 
       const { embed, row } = createNowPlayingEmbed(track, guildId);
-      await queue.textChannel.send({ embeds: [embed], components: [row] });
+      const nowPlayingMsg = await queue.textChannel.send({
+        embeds: [embed],
+        components: [row],
+      });
+      queue.nowPlayingMessage = nowPlayingMsg;
+
+      // Fetch recommendations asynchronously (don't block playback)
+      this.fetchRecommendations(track.url).then((recs) => {
+        const currentQueue = this.queueService.get(guildId);
+        if (!currentQueue || currentQueue.currentTrack !== track) return;
+
+        currentQueue.recommendations = recs;
+        if (recs.length > 0 && currentQueue.nowPlayingMessage) {
+          const components = createNowPlayingComponents(guildId, recs);
+          currentQueue.nowPlayingMessage.edit({ components }).catch((err) =>
+            this.logger.warn(`Failed to add recommendation buttons: ${err}`),
+          );
+        }
+      }).catch((err) => {
+        this.logger.warn(`Failed to fetch recommendations: ${err}`);
+      });
     } catch (error) {
       this.logger.error(`Stream error for "${track.title}": ${error}`);
+      queue.isStreamTransitioning = false;
       this.playNext(guildId);
     }
+  }
+
+  async fetchRecommendations(videoUrl: string): Promise<Track[]> {
+    const videoIdMatch = videoUrl.match(/(?:v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
+    if (!videoIdMatch) return [];
+
+    const videoId = videoIdMatch[1];
+    const mixUrl = `https://www.youtube.com/watch?v=${videoId}&list=RD${videoId}`;
+    const cookieArgs = this.getCookieArgs();
+    const args = [
+      '--flat-playlist',
+      '--dump-json',
+      ...cookieArgs,
+      mixUrl,
+    ];
+
+    this.logger.log(`Fetching recommendations for ${videoId}`);
+
+    return new Promise((resolve) => {
+      const proc = spawn('yt-dlp', args);
+      let stdout = '';
+      let stderr = '';
+
+      proc.stdout.on('data', (chunk: Buffer) => {
+        stdout += chunk.toString();
+      });
+
+      proc.stderr.on('data', (chunk: Buffer) => {
+        stderr += chunk.toString();
+      });
+
+      proc.on('close', (code) => {
+        if (code !== 0 || !stdout) {
+          this.logger.warn(`yt-dlp recommendations failed (exit ${code})`);
+          if (stderr) this.logger.warn(`yt-dlp stderr: ${stderr}`);
+          resolve([]);
+          return;
+        }
+        try {
+          const lines = stdout.trim().split('\n');
+          const tracks: Track[] = [];
+          for (const line of lines) {
+            const info = JSON.parse(line);
+            const id = info.id ?? info.url;
+            // Skip the current video
+            if (id === videoId) continue;
+            tracks.push({
+              url: info.url?.startsWith('http')
+                ? info.url
+                : `https://www.youtube.com/watch?v=${id}`,
+              title: info.title ?? 'Unknown',
+              duration: info.duration_string ?? '0:00',
+              thumbnail: info.thumbnail ?? info.thumbnails?.[0]?.url ?? '',
+              requestedBy: '',
+            });
+            if (tracks.length >= 3) break;
+          }
+          this.logger.log(`Found ${tracks.length} recommendations`);
+          resolve(tracks);
+        } catch (err) {
+          this.logger.warn(`Failed to parse recommendations JSON: ${err}`);
+          resolve([]);
+        }
+      });
+
+      proc.on('error', (err) => {
+        this.logger.warn(`yt-dlp recommendations spawn error: ${err.message}`);
+        resolve([]);
+      });
+    });
   }
 
   private static readonly IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
   playNext(guildId: string): void {
+    const queue = this.queueService.get(guildId);
+    if (!queue || queue.isStreamTransitioning) return;
+
+    const previousTrack = queue.currentTrack;
     const nextTrack = this.queueService.nextTrack(guildId);
     if (nextTrack) {
-      this.streamTrack(guildId, nextTrack);
+      this.streamTrack(guildId, nextTrack, previousTrack);
     } else {
       this.scheduleIdleDisconnect(guildId);
     }
@@ -248,6 +368,16 @@ export class PlayerService {
   private scheduleIdleDisconnect(guildId: string): void {
     const queue = this.queueService.get(guildId);
     if (!queue) return;
+
+    // Edit the last Now Playing message into "Played"
+    if (queue.nowPlayingMessage && queue.currentTrack) {
+      const lastTrack = queue.currentTrack;
+      const { embed } = createPlayedEmbed(lastTrack);
+      queue.nowPlayingMessage.edit({ embeds: [embed], components: [] }).catch((err) =>
+        this.logger.warn(`Failed to edit Now Playing on idle: ${err}`),
+      );
+      queue.nowPlayingMessage = null;
+    }
 
     this.clearIdleTimeout(queue);
     queue.currentTrack = null;

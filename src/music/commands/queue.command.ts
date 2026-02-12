@@ -23,8 +23,8 @@ export class QueueCommand {
         });
       }
 
-      const embed = createQueueEmbed(queue);
-      return await interaction.reply({ embeds: [embed] });
+      const { embed, row } = createQueueEmbed(queue, interaction.guildId!);
+      return await interaction.reply({ embeds: [embed], components: [row] });
     } catch (error) {
       this.logger.error(`Queue command error: ${error}`);
     }
