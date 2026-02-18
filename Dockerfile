@@ -30,6 +30,8 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
+RUN echo '--js-runtimes node' > /etc/yt-dlp.conf
+
 WORKDIR /app
 
 COPY --from=build /app/node_modules ./node_modules
